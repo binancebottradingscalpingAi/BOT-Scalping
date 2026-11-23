@@ -1,0 +1,852 @@
+
+
+import asyncio
+import os
+import time
+import logging
+from decimal import Decimal
+
+from dotenv import load_dotenv
+
+from binance import AsyncClient, BinanceSocketManager
+from binance.exceptions import BinanceAPIException
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+API_KEY = os.getenv("")
+
+API_SECRET = os.getenv("")
+
+
+
+SYMBOL = "btcusdt"
+
+DRY_RUN = True
+
+TRADE_USDT = 20.0
+
+# Order book
+DEPTH_LEVELS = 10
+
+# Signal
+BUY_SCORE = 75
+SELL_SCORE = 25
+
+# Spread protection
+MAX_SPREAD = 0.0005       # 0.05%
+
+# Risk
+TAKE_PROFIT = 0.0015      # +0.15%
+STOP_LOSS = 0.0010        # -0.10%
+
+# Maximum position lifetime
+MAX_HOLD_TIME = 5.0       # seconds
+
+# Cooldown after trade
+COOLDOWN = 2.0
+
+# Trade-flow window
+FLOW_WINDOW = 100
+
+# Momentum window
+PRICE_WINDOW = 50
+
+
+# ============================================================
+# BINANCE WEBSOCKET
+# ============================================================
+
+WS_URL = (
+    "wss://stream.binance.com:9443/stream?"
+    f"streams={SYMBOL}@depth10@100ms/"
+    f"{SYMBOL}@aggTrade"
+)
+
+
+# ============================================================
+# MARKET STATE
+# ============================================================
+
+bids = {}
+asks = {}
+
+trade_flow = deque(maxlen=FLOW_WINDOW)
+price_history = deque(maxlen=PRICE_WINDOW)
+
+last_price = 0.0
+last_update = 0
+
+
+# ============================================================
+# POSITION
+# ============================================================
+
+position = None
+
+last_trade_time = 0
+
+
+# ============================================================
+# POSITION OBJECT
+# ============================================================
+
+class Position:
+
+    def __init__(self, side, price, quantity):
+
+        self.side = side
+        self.entry_price = price
+        self.quantity = quantity
+        self.entry_time = time.time()
+
+
+# ============================================================
+# ORDER BOOK
+# ============================================================
+
+def update_order_book(data):
+
+    global bids
+    global asks
+
+    bids = {
+        float(price): float(quantity)
+        for price, quantity in data["bids"]
+        if float(quantity) > 0
+    }
+
+    asks = {
+        float(price): float(quantity)
+        for price, quantity in data["asks"]
+        if float(quantity) > 0
+    }
+
+
+# ============================================================
+# BEST BID / ASK
+# ============================================================
+
+def get_best_prices():
+
+    if not bids or not asks:
+        return None, None
+
+    best_bid = max(bids.keys())
+    best_ask = min(asks.keys())
+
+    return best_bid, best_ask
+
+
+# ============================================================
+# SPREAD
+# ============================================================
+
+def calculate_spread(bid, ask):
+
+    mid = (bid + ask) / 2
+
+    if mid <= 0:
+        return 999
+
+    return (ask - bid) / mid
+
+
+# ============================================================
+# ORDER BOOK IMBALANCE
+# ============================================================
+
+def calculate_imbalance():
+
+    if not bids or not asks:
+        return 0.5
+
+    bid_levels = sorted(
+        bids.items(),
+        reverse=True
+    )[:DEPTH_LEVELS]
+
+    ask_levels = sorted(
+        asks.items()
+    )[:DEPTH_LEVELS]
+
+    bid_volume = sum(
+        quantity
+        for price, quantity in bid_levels
+    )
+
+    ask_volume = sum(
+        quantity
+        for price, quantity in ask_levels
+    )
+
+    total = bid_volume + ask_volume
+
+    if total <= 0:
+        return 0.5
+
+    return bid_volume / total
+
+
+# ============================================================
+# MICROPRICE
+# ============================================================
+
+def calculate_microprice(bid, ask):
+
+    bid_volume = bids.get(bid, 0)
+    ask_volume = asks.get(ask, 0)
+
+    total = bid_volume + ask_volume
+
+    if total <= 0:
+        return (bid + ask) / 2
+
+    microprice = (
+        ask * bid_volume +
+        bid * ask_volume
+    ) / total
+
+    return microprice
+
+
+# ============================================================
+# TRADE FLOW
+# ============================================================
+
+def calculate_trade_flow():
+
+    if not trade_flow:
+        return 0.5
+
+    buy_volume = 0
+    sell_volume = 0
+
+    for side, quantity in trade_flow:
+
+        if side == "BUY":
+            buy_volume += quantity
+
+        else:
+            sell_volume += quantity
+
+    total = buy_volume + sell_volume
+
+    if total <= 0:
+        return 0.5
+
+    return buy_volume / total
+
+
+# ============================================================
+# MOMENTUM
+# ============================================================
+
+def calculate_momentum():
+
+    if len(price_history) < 5:
+        return 0
+
+    old_price = price_history[0]
+    current_price = price_history[-1]
+
+    if old_price <= 0:
+        return 0
+
+    return (
+        current_price - old_price
+    ) / old_price
+
+
+# ============================================================
+# SIGNAL SCORE
+# ============================================================
+
+def calculate_score(
+    imbalance,
+    trade_ratio,
+    momentum,
+    microprice,
+    midprice
+):
+
+    buy_score = 0
+    sell_score = 0
+
+    # --------------------------------------------------------
+    # ORDER BOOK
+    # --------------------------------------------------------
+
+    if imbalance >= 0.65:
+
+        buy_score += 30
+
+    elif imbalance <= 0.35:
+
+        sell_score += 30
+
+    # --------------------------------------------------------
+    # TRADE FLOW
+    # --------------------------------------------------------
+
+    if trade_ratio >= 0.65:
+
+        buy_score += 25
+
+    elif trade_ratio <= 0.35:
+
+        sell_score += 25
+
+    # --------------------------------------------------------
+    # MICROPRICE
+    # --------------------------------------------------------
+
+    micro_delta = (
+        microprice - midprice
+    ) / midprice
+
+    if micro_delta > 0.00002:
+
+        buy_score += 25
+
+    elif micro_delta < -0.00002:
+
+        sell_score += 25
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    if momentum > 0.00005:
+
+        buy_score += 15
+
+    elif momentum < -0.00005:
+
+        sell_score += 15
+
+    # --------------------------------------------------------
+    # Small market confirmation
+    # --------------------------------------------------------
+
+    if imbalance > 0.55 and trade_ratio > 0.55:
+
+        buy_score += 5
+
+    elif imbalance < 0.45 and trade_ratio < 0.45:
+
+        sell_score += 5
+
+    return buy_score, sell_score
+
+
+# ============================================================
+# CREATE ORDER
+# ============================================================
+
+async def execute_order(
+    side,
+    price,
+    quantity
+):
+
+    global position
+    global last_trade_time
+
+    if DRY_RUN:
+
+        print(
+            f"\n[DRY ORDER] "
+            f"{side} "
+            f"{quantity:.8f} "
+            f"@ {price:.2f}"
+        )
+
+    else:
+
+        # ====================================================
+        # LIVE BINANCE EXECUTION
+        # ====================================================
+        #
+        # Di sini nantinya kita tambahkan:
+        #
+        # Binance WebSocket API
+        # signed order
+        # order ID
+        # partial fill
+        # fill confirmation
+        # retry
+        # cancel/replace
+        #
+        # ====================================================
+
+        raise NotImplementedError(
+            "Live execution belum diaktifkan."
+        )
+
+    if side == "BUY":
+
+        position = Position(
+            side="LONG",
+            price=price,
+            quantity=quantity
+        )
+
+    elif side == "SELL":
+
+        position = None
+
+    last_trade_time = time.time()
+
+
+# ============================================================
+# ENTRY ENGINE
+# ============================================================
+
+async def check_entry(
+    bid,
+    ask,
+    buy_score,
+    sell_score
+):
+
+    global last_trade_time
+    global position
+
+    if position is not None:
+        return
+
+    now = time.time()
+
+    if now - last_trade_time < COOLDOWN:
+
+        return
+
+    spread = calculate_spread(
+        bid,
+        ask
+    )
+
+    if spread > MAX_SPREAD:
+
+        return
+
+    # --------------------------------------------------------
+    # BUY
+    # --------------------------------------------------------
+
+    if buy_score >= BUY_SCORE:
+
+        quantity = (
+            TRADE_USDT / ask
+        )
+
+        print(
+            f"\n[BUY SIGNAL]"
+            f"\nScore: {buy_score}"
+            f"\nAsk: {ask:.2f}"
+            f"\nSpread: {spread:.4%}"
+        )
+
+        await execute_order(
+            "BUY",
+            ask,
+            quantity
+        )
+
+    # --------------------------------------------------------
+    # SELL SIGNAL
+    # --------------------------------------------------------
+
+    elif sell_score >= (
+        100 - SELL_SCORE
+    ):
+
+        print(
+            f"\n[SELL SIGNAL]"
+            f"\nScore: {sell_score}"
+            f"\nBid: {bid:.2f}"
+            f"\nSpread: {spread:.4%}"
+        )
+
+        # Untuk spot tanpa posisi:
+        # jangan short.
+        #
+        # Kalau ingin SHORT,
+        # gunakan Binance Futures
+        # dan logic-nya berbeda.
+
+        return
+
+
+# ============================================================
+# POSITION MANAGEMENT
+# ============================================================
+
+async def manage_position(
+    bid,
+    ask
+):
+
+    global position
+
+    if position is None:
+        return
+
+    entry = position.entry_price
+
+    current = bid
+
+    profit = (
+        current - entry
+    ) / entry
+
+    holding_time = (
+        time.time()
+        - position.entry_time
+    )
+
+    # --------------------------------------------------------
+    # TAKE PROFIT
+    # --------------------------------------------------------
+
+    if profit >= TAKE_PROFIT:
+
+        print(
+            f"\n[TAKE PROFIT]"
+            f"\nProfit: {profit:.4%}"
+        )
+
+        await execute_order(
+            "SELL",
+            bid,
+            position.quantity
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # STOP LOSS
+    # --------------------------------------------------------
+
+    if profit <= -STOP_LOSS:
+
+        print(
+            f"\n[STOP LOSS]"
+            f"\nLoss: {profit:.4%}"
+        )
+
+        await execute_order(
+            "SELL",
+            bid,
+            position.quantity
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # TIME EXIT
+    # --------------------------------------------------------
+
+    if holding_time >= MAX_HOLD_TIME:
+
+        print(
+            f"\n[TIME EXIT]"
+            f"\nHolding: {holding_time:.2f}s"
+            f"\nPnL: {profit:.4%}"
+        )
+
+        await execute_order(
+            "SELL",
+            bid,
+            position.quantity
+        )
+
+
+# ============================================================
+# MARKET PROCESSOR
+# ============================================================
+
+async def process_market():
+
+    global last_price
+
+    while True:
+
+        if not bids or not asks:
+
+            await asyncio.sleep(0.001)
+
+            continue
+
+        bid, ask = get_best_prices()
+
+        if bid is None or ask is None:
+
+            continue
+
+        midprice = (
+            bid + ask
+        ) / 2
+
+        last_price = midprice
+
+        price_history.append(
+            midprice
+        )
+
+        # ----------------------------------------------------
+        # Indicators
+        # ----------------------------------------------------
+
+        imbalance = (
+            calculate_imbalance()
+        )
+
+        trade_ratio = (
+            calculate_trade_flow()
+        )
+
+        microprice = (
+            calculate_microprice(
+                bid,
+                ask
+            )
+        )
+
+        momentum = (
+            calculate_momentum()
+        )
+
+        # ----------------------------------------------------
+        # Score
+        # ----------------------------------------------------
+
+        buy_score, sell_score = (
+            calculate_score(
+                imbalance,
+                trade_ratio,
+                momentum,
+                microprice,
+                midprice
+            )
+        )
+
+        # ----------------------------------------------------
+        # Position
+        # ----------------------------------------------------
+
+        await manage_position(
+            bid,
+            ask
+        )
+
+        # ----------------------------------------------------
+        # Entry
+        # ----------------------------------------------------
+
+        await check_entry(
+            bid,
+            ask,
+            buy_score,
+            sell_score
+        )
+
+        await asyncio.sleep(0)
+
+
+# ============================================================
+# WEBSOCKET RECEIVER
+# ============================================================
+
+async def websocket_receiver():
+
+    global last_update
+
+    while True:
+
+        try:
+
+            print(
+                "[WS] Connecting..."
+            )
+
+            async with websockets.connect(
+                WS_URL,
+                ping_interval=20,
+                ping_timeout=20,
+                max_queue=None
+            ) as websocket:
+
+                print(
+                    "[WS] Connected"
+                )
+
+                async for message in websocket:
+
+                    packet = json.loads(
+                        message
+                    )
+
+                    data = packet.get(
+                        "data",
+                        {}
+                    )
+
+                    stream = packet.get(
+                        "stream",
+                        ""
+                    )
+
+                    # ------------------------------------------------
+                    # ORDER BOOK
+                    # ------------------------------------------------
+
+                    if "@depth" in stream:
+
+                        update_order_book(
+                            data
+                        )
+
+                    # ------------------------------------------------
+                    # AGGREGATED TRADE
+                    # ------------------------------------------------
+
+                    elif "@aggTrade" in stream:
+
+                        price = float(
+                            data["p"]
+                        )
+
+                        quantity = float(
+                            data["q"]
+                        )
+
+                        # Binance:
+                        # m=True means buyer is market maker
+                        # therefore aggressive seller.
+                        #
+                        # m=False = aggressive buyer.
+
+                        if data["m"]:
+
+                            side = "SELL"
+
+                        else:
+
+                            side = "BUY"
+
+                        trade_flow.append(
+                            (
+                                side,
+                                quantity
+                            )
+                        )
+
+                        price_history.append(
+                            price
+                        )
+
+                    last_update = time.time()
+
+        except Exception as e:
+
+            print(
+                "[WS ERROR]",
+                e
+            )
+
+            await asyncio.sleep(1)
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+async def status_loop():
+
+    while True:
+
+        if bids and asks:
+
+            bid, ask = (
+                get_best_prices()
+            )
+
+            imbalance = (
+                calculate_imbalance()
+            )
+
+            flow = (
+                calculate_trade_flow()
+            )
+
+            momentum = (
+                calculate_momentum()
+            )
+
+            print(
+                f"\r"
+                f"Bid {bid:.2f} | "
+                f"Ask {ask:.2f} | "
+                f"Imb {imbalance:.2f} | "
+                f"Flow {flow:.2f} | "
+                f"Mom {momentum:.5%} | "
+                f"Pos {position is not None}",
+                end=""
+            )
+
+        await asyncio.sleep(1)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def main():
+
+    print("=" * 65)
+    print(" BINANCE ORDER-FLOW HFT BOT")
+    print("=" * 65)
+
+    print(
+        f"Symbol: {SYMBOL.upper()}"
+    )
+
+    print(
+        f"Trade size: {TRADE_USDT} USDT"
+    )
+
+    print(
+        f"DRY RUN: {DRY_RUN}"
+    )
+
+    print("=" * 65)
+
+    await asyncio.gather(
+
+        websocket_receiver(),
+
+        process_market(),
+
+        status_loop()
+
+    )
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+
+    try:
+
+        asyncio.run(main())
+
+    except KeyboardInterrupt:
+
+        print(
+            "\nBot stopped."
